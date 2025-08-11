@@ -67,7 +67,7 @@ exports.createSeller = async (req, res) => {
   }
 }; */
 
-
+/*
 exports.createSeller = async (req, res) => {
   const {
     name,
@@ -76,7 +76,7 @@ exports.createSeller = async (req, res) => {
     password,
     brandName,
     gstNumber,
-    fullAddress, // ✅ camelCase me rakho
+   fullAddress,// ✅ camelCase me rakho
     aadhaarFrontImage,
     aadhaarBackImage,
   } = req.body;
@@ -95,7 +95,7 @@ exports.createSeller = async (req, res) => {
           email,
           phone,
           password: hashedPassword,
-          fullAddress, // ✅ correct property
+          fullAddress,
           role: 'seller',
         });
         const savedUser = await user.save();
@@ -112,7 +112,7 @@ exports.createSeller = async (req, res) => {
       userId: userId || null, // null allowed
       brandName,
       gstNumber,
-      fullAddress, // ✅ include fullAddress in seller too
+      fullAddress,
       aadhaarCard: {
         frontImage: aadhaarFrontImage,
         backImage: aadhaarBackImage,
@@ -137,6 +137,88 @@ exports.createSeller = async (req, res) => {
     });
   }
 };
+
+*/
+// server/controllers/seller.controller.js
+
+const parseMaybeJSON = (val) => {
+  if (!val) return undefined;
+  if (typeof val === 'object') return val;
+  try { return JSON.parse(val); } catch { return undefined; }
+};
+
+exports.createSeller = async (req, res) => {
+  try {
+    const {
+      // allow both naming styles from client
+      name, fullName,
+      phone, mobile,
+      email, password,
+      brandName, gstNumber,
+      fullAddress, line1, line2, postalCode, city, state, country,
+      aadhaarFrontUrl, aadhaarBackUrl,
+    } = req.body;
+
+    const sellerName = fullName || name;
+    const sellerPhone = mobile || phone;
+
+    if (!sellerName || !sellerPhone || !email || !password || !brandName || !gstNumber) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    // Address: support flat or object
+    let addr = parseMaybeJSON(fullAddress);
+    if (!addr) {
+      addr = { line1, line2, postalCode, city, state, country: country || 'India' };
+    }
+    if (!addr?.line1 || !addr?.postalCode || !addr?.city || !addr?.state) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide complete address (line1, postalCode, city, state)."
+      });
+    }
+
+    // User create or reuse
+    let user = await User.findOne({ $or: [{ email }, { phone: sellerPhone }] });
+    if (!user) {
+      const hash = await bcrypt.hash(password, 10);
+      user = await User.create({
+        name: sellerName,
+        email,
+        phone: sellerPhone,
+        password: hash,
+        role: 'seller',
+        fullAddress: addr,
+      });
+    }
+
+    const seller = await Seller.create({
+      userId: user._id,
+      brandName,
+      gstNumber,
+      fullAddress: addr,
+      aadhaarCard: {
+        front: { url: aadhaarFrontUrl || undefined },
+        back: { url: aadhaarBackUrl || undefined },
+      },
+      isActive: true
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: '✅ Seller profile created successfully',
+      seller
+    });
+  } catch (error) {
+    console.error('❌ Seller creation failed:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Seller creation failed',
+      error: error.message
+    });
+  }
+};
+
 
 
 // ✅ Get all sellers (admin) with optional status filter

@@ -17,92 +17,95 @@ function maybeJSON(input) {
 //const Buyer = require('../models/buyer.model');
 const User = require('../models/user.model'); // import karo User model
 const { generateToken } = require('../utils/token.utils'); // token generator
-//const maybeJSON = require('../utils/maybeJSON');
+
+
+
+// ✅ helpers (proper declarations)
+const normalizeDocType = (t = '') => {
+  const x = String(t || '').trim().toLowerCase();
+  if (['aadhaar', 'aadhaar card', 'aadhar', 'aadhar card'].includes(x)) return 'AADHAAR';
+  if (['pan', 'pan card'].includes(x)) return 'PAN';
+  if (['udyam', 'udyam certificate'].includes(x)) return 'UDYAM';
+  if (['gst', 'gst certificate'].includes(x)) return 'GST';
+  return 'OTHER';
+};
+
+const toImageObj = (url) => (url ? { url, public_id: undefined } : undefined);
+
+const parseMaybeJSON = (val) => {
+  if (!val) return undefined;
+  if (typeof val === 'object') return val;
+  try { return JSON.parse(val); } catch { return undefined; }
+};
 
 exports.createBuyer = async (req, res) => {
   try {
     const {
-      employeeCode,
-      name,
-      mobile,
-      email,
-      gender,
-      shopName,
-      shopAddress,
-      country,
-      state,
-      city,
-      postalCode,
+      employeeCode, name, mobile, email, gender,
+      shopName, shopAddress, country, state, city, postalCode,
       password,
-      documents,
-      bankName,
-      branchName,
-      accountHolderName,
-      accountNumber,
-      ifscCode,
-      beneficiaryName,
-      shopImageUrl
+      documents, // [{ type, number, fileUrl }]
+      bankName, branchName, accountHolderName, accountNumber, ifscCode, beneficiaryName,
+      shopImageUrl,
     } = req.body;
 
     if (!employeeCode || !name || !mobile || !gender || !shopName) {
-      return res.status(400).json({
-        message: "employeeCode, name, mobile, gender, shopName are required"
-      });
+      return res.status(400).json({ message: "employeeCode, name, mobile, gender, shopName are required" });
     }
 
-    // Duplicate check on Buyer and User collections
-    const dupBuyer = await Buyer.findOne({ $or: [{ mobile }, ...(email ? [{ email }] : [])] });
-    const dupUser = await User.findOne({ $or: [{ mobile }, ...(email ? [{ email }] : [])] });
+    const dup = await Buyer.findOne({ $or: [{ mobile }, ...(email ? [{ email }] : [])] });
+    if (dup) return res.status(400).json({ message: "Buyer already exists with same mobile/email" });
 
-    if (dupBuyer || dupUser) {
-      return res.status(400).json({ message: "Buyer already exists with same mobile/email" });
-    }
-
-    // Hash password
-    let passwordHash = null;
+    let passwordHash;
     if (password) {
       const salt = await bcrypt.genSalt(10);
       passwordHash = await bcrypt.hash(password, salt);
     }
 
-    let docsMeta = maybeJSON(documents) || [];
-    if (!Array.isArray(docsMeta)) docsMeta = [docsMeta];
+    // address (object chaahiye)
+    const addr = parseMaybeJSON(shopAddress) || shopAddress; // object ya string -> object
+    if (!addr || typeof addr !== 'object') {
+      return res.status(400).json({ message: 'shopAddress must be an object {line1, state, city, postalCode, country?}' });
+    }
 
-    const mappedDocs = docsMeta.map((d) => ({
-      type: d.type,
-      number: d.number,
-      fileUrl: d.fileUrl || null
-    }));
+    // documents normalize
+    let docs = parseMaybeJSON(documents) || documents || [];
+    if (!Array.isArray(docs)) docs = [docs];
+    const mappedDocs = docs
+      .filter(Boolean)
+      .map(d => ({
+        type: normalizeDocType(d.type),
+        number: d.number,
+        file: toImageObj(d.fileUrl),
+      }));
 
-    // 1️⃣ Create User record for buyer
-    const user = new User({
-      name,
-      email,
-      phone: mobile,
-      password: passwordHash,
-      role: "buyer",
-      isApproved: true,
-    });
-
-    const savedUser = await user.save();
-
-    // 2️⃣ Create Buyer profile linked to user._id
     const buyer = await Buyer.create({
-      userId: savedUser._id,    // link User and Buyer
       employeeCode,
       name,
       mobile,
       email,
       gender,
+      passwordHash,
+
       shopName,
-      shopAddress: maybeJSON(shopAddress),
-      shopImageUrl: shopImageUrl || null,
-      country,
-      state,
-      city,
-      postalCode,
-      password: passwordHash, // optional, you may keep only User password
+      shopImage: toImageObj(shopImageUrl),
+      shopAddress: {
+        line1: addr.line1,
+        line2: addr.line2,
+        country: addr.country || country || 'India',
+        state: addr.state,
+        city: addr.city,
+        postalCode: addr.postalCode,
+      },
+
+      // mirror duplicates (optional)
+      country: addr.country || country || 'India',
+      state: addr.state,
+      city: addr.city,
+      postalCode: addr.postalCode,
+
       documents: mappedDocs,
+
       bank: {
         bankName,
         branchName,
@@ -111,23 +114,14 @@ exports.createBuyer = async (req, res) => {
         ifscCode,
         beneficiaryName,
       },
+
       isApproved: true,
     });
 
-    // Generate token for buyer user
-    const token = generateToken(savedUser);
-
-    res.status(201).json({
-      message: "Buyer created and logged in",
-      buyer,
-      token,
-    });
+    return res.status(201).json({ message: 'Buyer created', buyer });
   } catch (err) {
-    console.error("createBuyer error:", err);
-    res.status(500).json({
-      message: "Failed to create buyer",
-      error: err.message,
-    });
+    console.error('createBuyer error:', err);
+    return res.status(500).json({ message: 'Failed to create buyer', error: err.message });
   }
 };
 

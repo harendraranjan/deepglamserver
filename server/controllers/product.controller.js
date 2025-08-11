@@ -1,109 +1,134 @@
+// controllers/product.controller.js
+const mongoose = require('mongoose');
 const Product = require("../models/product.model");
-const cloudinary = require('../config/cloudinary');
 
-// 🆕 Create Product
-
-/*
-// 🔢 Utility: Calculate Final Price
-const calculateFinalPrice = ({
-  purchasePrice,
-  margin = 0,
-  discountPercentage = 0,
-  gstPercentage = 0,
-  gstType = 'exclusive',
-}) => {
-  const basePrice = purchasePrice + (margin / 100) * purchasePrice;
-  const discountAmount = (discountPercentage / 100) * basePrice;
-  const priceAfterDiscount = basePrice - discountAmount;
-
-  const gstAmount =
-    gstType === 'exclusive' ? (gstPercentage / 100) * priceAfterDiscount : 0;
-
-  const finalPrice = priceAfterDiscount + gstAmount;
-
-  return { basePrice, discountAmount, gstAmount, finalPrice };
+// ---- helpers ----
+const toNum = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const toStringArray = (v) => {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(String).map(s => s.trim()).filter(Boolean);
+  if (typeof v === 'string') {
+    const s = v.trim();
+    try { const arr = JSON.parse(s); if (Array.isArray(arr)) return arr.map(String).map(x=>x.trim()).filter(Boolean); } catch {}
+    return s.split(',').map(x=>x.trim()).filter(Boolean);
+  }
+  return [];
 };
-*/
-// helper: multer file -> { url, public_id }
-//const toImage = f => (f ? { url: f.path, public_id: f.filename || null } : null);
+const calc = ({ price, discountPercentage=0, discountAmount=0, gstPercentage=0, gstType='exclusive' }) => {
+  const discByPct = price * (toNum(discountPercentage)/100);
+  const disc = Math.max(toNum(discountAmount), discByPct);
+  const afterDisc = Math.max(price - disc, 0);
+  const inclusive = String(gstType).toLowerCase() === 'inclusive';
+  const gstAmt = inclusive
+    ? (afterDisc - (afterDisc / (1 + toNum(gstPercentage)/100)))
+    : (afterDisc * toNum(gstPercentage)/100);
+  const final = inclusive ? afterDisc : (afterDisc + gstAmt);
+  return { priceAfterDiscount: afterDisc, gstAmount: gstAmt, finalPrice: final, discountApplied: disc };
+};
+
+// Normalize image fields to { url }
+const toImageObj = (v) => {
+  if (!v) return null;
+  if (typeof v === 'string') return { url: v };
+  if (v && typeof v === 'object' && v.url) return { url: v.url };
+  return null;
+};
+const toImageObjArray = (arr) => {
+  if (!arr) return [];
+  const a = Array.isArray(arr) ? arr : [];
+  return a.map(toImageObj).filter(Boolean);
+};
 
 exports.createProduct = async (req, res) => {
   try {
     const {
-      mainCategory,
-      subCategory,
-      productType,
-      productname,
-      gender,
-      hsnCode,
-      MOQ,
-      purchasePrice,
-      margin = 0,
-      discountPercentage = 0,
-      discountAmount = 0,
-      gstPercentage = 0,
-      gstType = "exclusive",
-      sizes,
-      colors,
-      brand,
-      stock,
-      sellerId,
-      mainImage, // JSON me direct URL
-      images = [] // JSON me URLs ka array
+      mainCategory, subCategory, productType, productname,
+      hsnCode, MOQ, purchasePrice, margin=0,
+      discountPercentage=0, discountAmount=0, gstPercentage=0, gstType='exclusive',
+      sizes, colors, brand, stock,
+      sellerId,                  // optional in body
+      mainImage,                 // string or {url}
+      images = []                // string[] or {url}[]
     } = req.body;
 
-    // Calculate base price
-    const basePrice = Number(purchasePrice) + (Number(margin) / 100) * Number(purchasePrice);
+    // ---- required fields ----
+    if (!productname) return res.status(400).json({ message: 'productname is required' });
+    if (!mainCategory) return res.status(400).json({ message: 'mainCategory is required' });
+    if (!subCategory) return res.status(400).json({ message: 'subCategory is required' });
+    if (purchasePrice === undefined || purchasePrice === null)
+      return res.status(400).json({ message: 'purchasePrice is required' });
+    if (!mainImage) return res.status(400).json({ message: 'mainImage URL is required' });
 
-    // Price calculation
-    const { priceAfterDiscount, gstAmount, finalPrice } = calculateFinalPrice({
-      price: basePrice,
-      discountPercentage: Number(discountPercentage),
-      discountAmount: Number(discountAmount),
-      gstPercentage: Number(gstPercentage),
-      gstType,
+    // ---- seller resolution: req.user → body.sellerId → header x-seller-id ----
+    const sellerHeader = req.headers['x-seller-id'];
+    const seller = (req.user && req.user._id) || sellerId || sellerHeader || null;
+    if (!seller) {
+      return res.status(400).json({ message: 'seller is required (send Authorization Bearer token OR sellerId in body OR x-seller-id header)' });
+    }
+    if (!mongoose.isValidObjectId(seller)) {
+      return res.status(400).json({ message: 'Invalid seller id format' });
+    }
+
+    // ---- pricing ----
+    const purchase = toNum(purchasePrice);
+    const marginNum = toNum(margin);
+    const basePrice = purchase + (marginNum/100) * purchase;
+
+    const { priceAfterDiscount, gstAmount, finalPrice, discountApplied } = calc({
+      price: basePrice, discountPercentage, discountAmount, gstPercentage, gstType
     });
 
-    // Parse arrays if strings
-    const parsedSizes = typeof sizes === "string" ? JSON.parse(sizes) : sizes;
-    const parsedColors = typeof colors === "string" ? JSON.parse(colors) : colors;
+    // ---- arrays / text ----
+    const parsedSizes = toStringArray(sizes);
+    const parsedColors = toStringArray(colors);
+
+    // ---- images normalize to embedded docs ----
+    const mainImageObj = toImageObj(mainImage);
+    const imageObjs = toImageObjArray(images);
+
+    // extra guard
+    if (!mainImageObj) return res.status(400).json({ message: 'mainImage must be a URL string or { url }' });
 
     const newProduct = new Product({
-      seller: req.user?._id || sellerId || null,
+      seller, // required
       mainCategory,
       subCategory,
-      productType: productType?.toLowerCase(),
+      productType: productType ? String(productType).toLowerCase() : undefined,
       productname,
-      gender: gender?.toLowerCase(),
       hsnCode,
-      MOQ: Number(MOQ) || 0,
-      purchasePrice: Number(purchasePrice) || 0,
-      margin: Number(margin) || 0,
+      MOQ: toNum(MOQ),
+      purchasePrice: purchase,
+      margin: marginNum,
       mrp: basePrice,
-      discountPercentage: Number(discountPercentage) || 0,
-      discountAmount: priceAfterDiscount < basePrice ? basePrice - priceAfterDiscount : 0,
-      gstPercentage: Number(gstPercentage) || 0,
+      discountPercentage: toNum(discountPercentage),
+      // prefer client-provided discountAmount; else computed
+      discountAmount: toNum(discountAmount) > 0 ? toNum(discountAmount) : (basePrice > priceAfterDiscount ? (basePrice - priceAfterDiscount) : 0),
+      gstPercentage: toNum(gstPercentage),
       gstAmount,
       gstType,
       finalPrice,
-      sizes: parsedSizes || [],
-      colors: parsedColors || [],
+      sizes: parsedSizes,
+      colors: parsedColors,
       brand,
-      stock: Number(stock) || 0,
-      mainImage, // direct URL
-      images, // URLs array
-      isApproved: false,
+      stock: toNum(stock),
+
+      // schema expects embedded docs
+      mainImage: mainImageObj,
+      images: imageObjs,
+
+      isApproved: true,
       isActive: true,
     });
 
     const saved = await newProduct.save();
-    res.status(201).json({ message: "Product created", product: saved });
+    return res.status(201).json({ message: 'Product created', product: saved });
 
   } catch (err) {
-    console.error("❌ Product creation error:", err);
-    res.status(500).json({ message: "Product creation failed", error: err.message });
+    console.error('❌ Product creation error:', err);
+    return res.status(500).json({ message: 'Product creation failed', error: err.message });
   }
 };
+
 
 
 // ✏️ Update Product

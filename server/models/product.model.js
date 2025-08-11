@@ -21,11 +21,11 @@ const productSchema = new mongoose.Schema(
     productname: { type: String, required: true },
 
     description: { type: String },
-    gender: {
+    /*gender: {
       type: String,
       enum: ['men', 'women', 'kids', 'unisex'],
     },
-
+*/
     hsnCode: { type: String }, // for GST classification
 
     MOQ: { type: Number, required: true }, // Minimum Order Quantity
