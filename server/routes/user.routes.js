@@ -2,7 +2,6 @@ const express = require("express");
 const router = express.Router();
 const userCtrl = require("../controllers/user.controller");
 const protect = require("../middlewares/auth.middleware");
-
 // 🔓 Public (optional protect with `protect`)
 router.get("/:id", userCtrl.getUserById);
 router.put("/:id", userCtrl.updateProfile);
