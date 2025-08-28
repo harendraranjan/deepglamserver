@@ -1,3 +1,4 @@
+// server/controllers/staff.controller.js
 const bcrypt = require("bcryptjs");
 const mongoose = require("mongoose");
 const dayjs = require("dayjs");
@@ -7,13 +8,168 @@ const Attendance = require("../models/attendance.model");
 const Buyer = require("../models/buyer.model");
 const User = require("../models/user.model");
 const Order = require("../models/order.model");
-const Product = require("../models/product.model"); // optional
-const Seller = require("../models/seller.model");   // optional
-const PaymentReceipt = require("../models/paymentReceipt.model");
+const Product = require("../models/product.model"); 
+const Seller = require("../models/seller.model");   
 
-const generateBillPDF = require("../utils/generateBillPDF");
+
+
+//const Order = require("../models/order.model");
+const Invoice = require("../models/invoice.model");
+const { createDynamicQR } = require("../utils/paytm");
+const { generateBillPDF } = require("../utils/generateBillPDF");
+
+const saveBufferLocally = (buf, filename, folder = "invoices") => {
+  const dir = path.join(__dirname, "..", "uploads", folder);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${filename}.pdf`);
+  fs.writeFileSync(file, buf);
+  return { url: `/uploads/${folder}/${filename}.pdf`, path: file };
+};
+
+const markReadyToDispatch = async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const role = req.user?.role || req.auth?.role;
+    if (!["staff", "seller", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ ok: false, message: "Forbidden" });
+    }
+
+    const { id } = req.params;
+    const { note, courier, awb } = req.body;
+
+    await session.withTransaction(async () => {
+      // 1) Order
+      const order = await Order.findById(id)
+        .populate("buyerId", "name phone email shopAddress")
+        .populate("sellerId", "brandName gstNumber")
+        .populate("products.product", "productname brand")
+        .session(session);
+
+      if (!order) throw new Error("Order not found");
+
+      // Dispatch mark
+      order.status = "dispatched";
+      order.dispatchInfo = { courier, awb, note, at: new Date(), by: req.user?._id };
+      order.logs = order.logs || [];
+      order.logs.push({ at: new Date(), by: req.user?._id, action: "DISPATCHED", note });
+      await order.save({ session });
+
+      // 2) Create Invoice
+      const invoiceNumber = order.orderNo ? `INV-${order.orderNo}` : `INV-${Date.now()}`;
+      const items = (order.products || []).map((p) => {
+        const pricePaise = Math.round(Number(p.price || 0) * 100);
+        const qty = Number(p.quantity || 1);
+        return {
+          productId: p.product?._id,
+          name: p.product?.productname || p.productName || "Item",
+          qty,
+          unitPricePaise: pricePaise,
+          lineTotalPaise: qty * pricePaise,
+          gstPercentage: order.gstRate || 0,
+          gstPaise: Math.round((order.gstAmount || 0) * 100),
+        };
+      });
+
+      const subtotalPaise = items.reduce((s, i) => s + (i.unitPricePaise * i.qty), 0);
+      const discountTotalPaise = Math.round(Number(order.discountAmount || 0) * 100);
+      const gstTotalPaise = Math.round(Number(order.gstAmount || 0) * 100);
+      const grandTotalPaise = Math.round(Number(order.finalAmount || 0) * 100);
+
+      let invoice = await Invoice.create([{
+        orderId: order._id,
+        sellerId: order.sellerId._id,
+        buyerId: order.buyerId._id,
+        brand: order.sellerId.brandName,
+        number: invoiceNumber,
+        items,
+        subtotalPaise,
+        discountTotalPaise,
+        gstTotalPaise,
+        grandTotalPaise,
+        balanceDuePaise: grandTotalPaise,
+        status: "unpaid",
+      }], { session }).then(r => r[0]);
+
+      // 3) Paytm Dynamic QR
+      try {
+        const qr = await createDynamicQR({
+          orderId: invoice.number,
+          amountPaise: invoice.balanceDuePaise,
+        });
+        invoice.paytm = qr;
+        await invoice.save({ session });
+      } catch (err) {
+        console.warn("Paytm QR failed:", err.message);
+      }
+
+      // 4) Generate Invoice PDF
+      const lineItems = invoice.items.map((i, idx) => ({
+        sn: idx + 1,
+        name: i.name,
+        qty: i.qty,
+        price: i.unitPricePaise / 100,
+        total: i.lineTotalPaise / 100,
+      }));
+
+      const header = {
+        billNumber: invoice.number,
+        orderId: order._id,
+        date: order.createdAt,
+      };
+
+      const opts = {
+        payment: {
+          qrString: invoice.paytm?.qrData || null,
+          status: invoice.status,
+        },
+        company: {
+          legalName: order.sellerId?.brandName || "Your Brand",
+          gstNumber: order.sellerId?.gstNumber || "",
+        },
+        shipping: {
+          address: order.fullAddress || order?.buyerId?.shopAddress?.line1 || "",
+          city: order.city || order?.buyerId?.shopAddress?.city || "",
+          state: order.state || order?.buyerId?.shopAddress?.state || "",
+          pincode: order.pincode || order?.buyerId?.shopAddress?.postalCode || "",
+          country: order.country || "India",
+        },
+        charges: {
+          totalAmount: subtotalPaise / 100,
+          discountAmount: discountTotalPaise / 100,
+          gstAmount: gstTotalPaise / 100,
+          finalAmount: grandTotalPaise / 100,
+          shipping: Number(order.shippingCharge || 0),
+          roundOff: Number(order.roundOff || 0),
+        },
+      };
+
+      const pdfBuffer = await generateBillPDF(header, lineItems, order.buyerId, order.sellerId, opts);
+
+      const saved = saveBufferLocally(pdfBuffer, `order-${order._id}`);
+      invoice.pdfPath = saved.path;
+      order.invoiceUrl = saved.url;
+
+      await invoice.save({ session });
+      await order.save({ session });
+
+      res.json({
+        ok: true,
+        message: "Order dispatched, invoice generated with Paytm QR",
+        order,
+        invoice,
+      });
+    });
+  } catch (e) {
+    console.error("markReadyToDispatch error:", e);
+    return res.status(400).json({ ok: false, message: e.message });
+  } finally {
+    session.endSession();
+  }
+};
+
 
 // If you use Cloudinary for raw PDFs:
+/*
 const cloudinary = require("cloudinary").v2;
 function uploadRawBuffer(buffer, publicId) {
   return new Promise((resolve, reject) => {
@@ -23,11 +179,11 @@ function uploadRawBuffer(buffer, publicId) {
     );
     stream.end(buffer);
   });
-}
+}*/
 
 // ---------- Config ----------
 const OFFICE_LAT = Number(process.env.OFFICE_LAT || 28.6139);
-theOFFICE_LNG = Number(process.env.OFFICE_LNG || 77.2090);
+const OFFICE_LNG = Number(process.env.OFFICE_LNG || 77.2090);
 const GEOFENCE_RADIUS_M = Number(process.env.GEOFENCE_RADIUS_M || 300);
 const SHIFT_START = process.env.SHIFT_START || "09:00";
 const SHIFT_END = process.env.SHIFT_END || "18:30";
@@ -35,15 +191,6 @@ const SHIFT_END = process.env.SHIFT_END || "18:30";
 // ---------- Helpers ----------
 const ok = (res, data, status = 200) => res.status(status).json({ ok: true, data });
 const fail = (res, error, status = 400) => res.status(status).json({ ok: false, error });
-
-const ensureRole = (req, roles = []) => {
-  const role = req.user?.role || req.auth?.role;
-  if (!role || !roles.includes(role)) {
-    const err = new Error("Forbidden");
-    err.status = 403;
-    throw err;
-  }
-};
 
 const parseHHMM = (hhmm) => {
   const [h, m] = String(hhmm || "").split(":").map(Number);
@@ -68,24 +215,69 @@ const haversineMeters = (lat1, lon1, lat2, lon2) => {
   return R * c;
 };
 
+/**
+ * Resolve Staff strictly via the logged-in user:
+ * 1) If req.auth.staffId provided (middleware), use it.
+ * 2) Else find Staff by { userId: req.user._id }.
+ * 3) Throw 404 if not found.
+ *//*
 const getStaffForReq = async (req) => {
+  // fast path if middleware already attached
   if (req.auth?.staffId) {
     const byId = await Staff.findById(req.auth.staffId);
     if (byId) return byId;
   }
-  if (req.user?._id) {
-    const byUser = await Staff.findOne({ userId: req.user._id });
-    if (byUser) return byUser;
+  if (!req.user?._id) {
+    const err = new Error("Unauthorized: user missing");
+    err.status = 401;
+    throw err;
   }
-  if (req.user?.phone) {
-    const byPhone = await Staff.findOne({ phone: req.user.phone });
-    if (byPhone) return byPhone;
-  }
-  if (req.user?.email) {
-    const byEmail = await Staff.findOne({ email: req.user.email });
-    if (byEmail) return byEmail;
-  }
+  const staff = await Staff.findOne({ userId: req.user._id });
+  if (staff) return staff;
+
   const err = new Error("Staff record not found for current user");
+  err.status = 404;
+  throw err;
+};*/
+// Resolve Staff strictly via logged-in user; fast path via verifyJWT
+const getStaffForReq = async (req) => {
+  // ✅ fast path from verifyJWT (resolveUserEntities)
+  if (req.user?.staffId) {
+    const byId = await Staff.findById(req.user.staffId);
+    if (byId) return byId;
+  }
+
+  if (!req.user?._id) {
+    const err = new Error("Unauthorized: user missing");
+    err.status = 401;
+    throw err;
+  }
+
+  // fallback by userId → Staff
+  const staff = await Staff.findOne({ userId: req.user._id });
+  if (staff) return staff;
+
+  const err = new Error("Staff record not found for current user");
+  err.status = 404;
+  throw err;
+};
+
+
+// Optional: seller resolver used in dispatch endpoint
+const getSellerForReq = async (req) => {
+  if (req.auth?.sellerId) {
+    const byId = await Seller.findById(req.auth.sellerId);
+    if (byId) return byId;
+  }
+  if (!req.user?._id) {
+    const err = new Error("Unauthorized: user missing");
+    err.status = 401;
+    throw err;
+  }
+  const seller = await Seller.findOne({ userId: req.user._id });
+  if (seller) return seller;
+
+  const err = new Error("Seller record not found for current user");
   err.status = 404;
   throw err;
 };
@@ -428,7 +620,7 @@ const checkIn = async (req, res) => {
 
     const staff = await getStaffForReq(req);
 
-    const dist = haversineMeters(lat, lng, OFFICE_LAT, theOFFICE_LNG);
+    const dist = haversineMeters(lat, lng, OFFICE_LAT, OFFICE_LNG);
     const withinFence = dist <= GEOFENCE_RADIUS_M;
     const now = new Date();
 
@@ -464,7 +656,7 @@ const checkOut = async (req, res) => {
     if (!att || !att.checkIn?.time) return fail(res, "No check-in found for today", 400);
     if (att.checkOut?.time) return fail(res, "Already checked-out", 409);
 
-    const dist = haversineMeters(lat, lng, OFFICE_LAT, theOFFICE_LNG);
+    const dist = haversineMeters(lat, lng, OFFICE_LAT, OFFICE_LNG);
     const now = new Date();
 
     att.checkOut = { time: now, lat, lng, withinFence: dist <= GEOFENCE_RADIUS_M };
@@ -490,6 +682,7 @@ const myAttendance = async (req, res) => {
 };
 
 // ------- Dispatch + Invoice -------
+/*
 const markReadyToDispatch = async (req, res) => {
   try {
     const role = req.user?.role || req.auth?.role;
@@ -522,6 +715,18 @@ const markReadyToDispatch = async (req, res) => {
         await order.save();
       } else if (!belongs) {
         return fail(res, "Forbidden for this order", 403);
+      }
+    } else if (role === "seller") {
+      // Optional: ensure only the owner seller dispatches
+      const seller = await getSellerForReq(req);
+      const hasSeller = !!order.sellerId;
+      const belongs = hasSeller && String(order.sellerId) === String(seller._id);
+
+      if (!hasSeller) {
+        order.sellerId = seller._id;
+        await order.save();
+      } else if (!belongs) {
+        return fail(res, "Forbidden for this order (different seller)", 403);
       }
     }
 
@@ -575,13 +780,169 @@ const markReadyToDispatch = async (req, res) => {
     console.error("markReadyToDispatch error:", e);
     return fail(res, e.message, e.status || 400);
   }
+};*/
+
+// ------- Dispatch + Invoice -------
+/*
+ const markReadyToDispatch = async (req, res) => {
+  try {
+    const role = req.user?.role || req.auth?.role;
+    if (!["staff", "seller", "admin", "superadmin"].includes(role)) {
+      return res.status(403).json({ ok: false, message: "Forbidden" });
+    }
+
+    const { id } = req.params;
+    const { note, courier, awb } = req.body;
+
+    // order + minimal populate (buyer/seller basic + product name)
+    const order = await Order.findById(id)
+      .populate("buyerId", "name phone email shopAddress")
+      .populate("sellerId", "brandName gstNumber")
+      .populate("products.product", "productname brand")
+      .populate("staffId", "name employeeCode");
+
+    if (!order) {
+      return res.status(404).json({ ok: false, message: "Order not found" });
+    }
+
+    // ---- STAFF OWNERSHIP (agar creator/owner set nahi hai to current staff set kar do) ----
+    if (role === "staff") {
+      // yahan apna helper laga lo agar hai (getStaffForReq). Nahi hai to token se:
+      const staffId = req.user?.staffId;
+      const employeeCode = req.user?.employeeCode;
+
+      const hasOwner = !!order.staffId || !!order.staffCode || !!order.createdBy;
+      const belongs =
+        (order.staffId && String(order.staffId._id || order.staffId) === String(staffId)) ||
+        (employeeCode && order.staffCode === employeeCode) ||
+        (order.createdBy && String(order.createdBy) === String(req.user?._id));
+
+      if (!hasOwner) {
+        if (staffId) order.staffId = staffId;
+        if (employeeCode) order.staffCode = employeeCode;
+        order.createdBy = req.user?._id;
+        await order.save();
+      } else if (!belongs) {
+        return res.status(403).json({ ok: false, message: "Forbidden for this order" });
+      }
+    }
+
+    // ---- SELLER OWNERSHIP (optional) ----
+    if (role === "seller") {
+      const sellerId = req.user?.sellerId;
+      const hasSeller = !!order.sellerId;
+      const belongs = hasSeller && String(order.sellerId) === String(sellerId);
+
+      if (!hasSeller) {
+        if (!sellerId) {
+          return res.status(400).json({ ok: false, message: "Seller not found in token" });
+        }
+        order.sellerId = sellerId;
+        await order.save();
+      } else if (!belongs) {
+        return res.status(403).json({ ok: false, message: "Forbidden (different seller)" });
+      }
+    }
+
+    // ---- Mark dispatched + dispatch log ----
+    order.status = "dispatched";
+    order.dispatchInfo = { courier, awb, note, at: new Date(), by: req.user?._id };
+    order.logs = order.logs || [];
+    order.logs.push({ at: new Date(), by: req.user?._id, action: "DISPATCHED", note });
+    await order.save();
+
+    // ///////////////////////////////
+    //     INVOICE PDF GENERATION
+    // ///////////////////////////////
+
+    // (optional) Paytm QR
+    // let paytmQR = null;
+    // try {
+    //   paytmQR = await createDynamicQR({
+    //     orderId: String(order._id),
+    //     amountPaise: Math.round(Number(order.finalAmount || 0) * 100),
+    //   });
+    // } catch (e) {
+    //   console.warn("Paytm QR failed:", e.message);
+    // }
+
+    // Line items
+    const lineItems = (order.products || []).map((li, idx) => ({
+      sn: idx + 1,
+      name:
+        li?.product?.productname ||
+        li?.productName ||
+        `Item ${idx + 1}`,
+      qty: Number(li.quantity || 1),
+      price: Number(li.price || 0),
+      total: Number(li.total || 0),
+      brand: li?.brand || li?.product?.brand,
+    }));
+
+    // Meta + options
+    const header = {
+      billNumber: order.orderNo ? `INV-${order.orderNo}` : `INV-${Date.now()}`,
+      orderId: order._id,
+      date: order.createdAt,
+    };
+
+    const opts = {
+      payment: {
+        // qrString: paytmQR?.qrData || null,
+        upi: "merchant@upi",
+        status: order.paymentStatus, // "paid" ho to PAID watermark show
+      },
+      company: {
+        legalName: order.sellerId?.brandName || "Your Brand",
+        gstNumber: order.sellerId?.gstNumber || "",
+      },
+      shipping: {
+        address: order.fullAddress || order?.buyerAddressSnapshot?.line1 || order?.buyerId?.shopAddress?.line1 || "",
+        city: order.city || order?.buyerAddressSnapshot?.city || order?.buyerId?.shopAddress?.city || "",
+        state: order.state || order?.buyerAddressSnapshot?.state || order?.buyerId?.shopAddress?.state || "",
+        pincode: order.pincode || order?.buyerAddressSnapshot?.postalCode || order?.buyerId?.shopAddress?.postalCode || "",
+        country: order.country || order?.buyerAddressSnapshot?.country || "India",
+      },
+      charges: {
+        totalAmount: Number(order.totalAmount || 0),
+        discountAmount: Number(order.discountAmount || 0),
+        gstAmount: Number(order.gstAmount || 0),
+        finalAmount: Number(order.finalAmount || 0),
+        shipping: Number(order.shippingCharge || 0),
+        roundOff: Number(order.roundOff || 0),
+      },
+    };
+
+    // PDF buffer
+    const pdfBuffer = await generateBillPDF(header, lineItems, order.buyerId, order.sellerId, opts);
+
+    // Upload: Cloudinary first → fallback to local
+    try {
+      const uploaded = await uploadRawBufferToCloudinary(pdfBuffer, {
+        publicId: `order-${String(order._id)}`,
+        folder: "invoices",
+      });
+      order.invoiceUrl = uploaded?.secure_url || uploaded?.url || order.invoiceUrl;
+    } catch (err) {
+      console.error("Cloudinary upload failed. Falling back:", err.message);
+      const local = saveBufferLocally(pdfBuffer, `order-${String(order._id)}`, "invoices");
+      order.invoiceUrl = local.url; // e.g. /uploads/invoices/order-xxxx.pdf
+    }
+
+    await order.save();
+
+    return res.json({ ok: true, message: "Order dispatched & invoice generated", order });
+  } catch (e) {
+    console.error("markReadyToDispatch error:", e);
+    return res.status(400).json({ ok: false, message: e.message });
+  }
 };
+*/
 
 // ------- Payments -------
 const pendingPaymentsByStaff = async (req, res) => {
   try {
     const staff = await getStaffForReq(req);
-    if (!staff) return res.status(404).json({ ok: false, error: 'Staff not found' });
 
     const page  = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
@@ -666,7 +1027,7 @@ const collectPayment = async (req, res) => {
 
   try {
     const { orderId, amount, method, reference, note } = req.body;
-    const staffId = req.user?.id || req.user?._id;
+    const staff = await getStaffForReq(req);
 
     const order = await Order.findById(orderId).session(session);
     if (!order) throw new Error("Order not found");
@@ -674,8 +1035,14 @@ const collectPayment = async (req, res) => {
     const amt = Math.max(0, Number(amount || 0));
 
     const receipt = await PaymentReceipt.create([{
-      orderId, buyerId: order.buyerId, staffId, staffCode: order.staffCode,
-      amount: amt, method, reference, note,
+      orderId,
+      buyerId: order.buyerId,
+      staffId: staff._id,
+      staffCode: staff.employeeCode,
+      amount: amt,
+      method,
+      reference,
+      note,
     }], { session });
 
     try {
@@ -792,5 +1159,5 @@ module.exports = {
   getTarget,
   setTarget,
 
-  _helpers: { getStaffForReq, inShift, haversineMeters },
+  _helpers: { getStaffForReq, getSellerForReq, inShift, haversineMeters },
 };

@@ -1,24 +1,23 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
-/* Subdocs same as before ... */
+const int = v => (v == null ? v : Math.round(Number(v) || 0)); // store money in paise
 
-// ⛳️ CHANGES START
 const buyerSchema = new mongoose.Schema(
   {
     employeeCode: { type: String, required: true },
     registeredBy: { type: mongoose.Schema.Types.ObjectId, ref: "Staff" },
-    staffId: { type: mongoose.Schema.Types.ObjectId, ref: "Staff" },
-    employee: { type: mongoose.Schema.Types.ObjectId, ref: "Staff" },
+    staffId:      { type: mongoose.Schema.Types.ObjectId, ref: "Staff" },
+    employee:     { type: mongoose.Schema.Types.ObjectId, ref: "Staff" },
 
     name: { type: String, required: true },
 
-    // ✅ Keep both fields so existing `mobile_1` unique index is satisfied
-    phone:  { type: String, required: true },  // primary in app
+    // ✅ Keep both; ensure uniqueness without breaking old data
+    phone:  { type: String, required: true },                 // primary in app
     mobile: { type: String, index: true, unique: true, sparse: true }, // mirrors phone
 
-    email: { type: String, trim: true, lowercase: true, index: true },
-    gender: { type: String, enum: ["male", "female", "other"], required: true },
+    email:   { type: String, trim: true, lowercase: true, index: true },
+    gender:  { type: String, enum: ["male", "female", "other"], required: true },
 
     passwordHash: { type: String },
 
@@ -28,66 +27,69 @@ const buyerSchema = new mongoose.Schema(
       line1: { type: String, required: true },
       line2: { type: String },
       country: { type: String, default: "India" },
-      state: { type: String, required: true },
-      city: { type: String, required: true },
+      state:   { type: String, required: true },
+      city:    { type: String, required: true },
       postalCode: { type: String, required: true }
     },
 
-    country: { type: String, default: "India" },
-    state: { type: String },
-    city: { type: String },
+    country:    { type: String, default: "India" },
+    state:      { type: String },
+    city:       { type: String },
     postalCode: { type: String },
 
     documents: [{
-      type: {
-        type: String,
-        required: true,
-        enum: ["PAN", "AADHAAR", "UDYAM", "GST", "OTHER"],
-      },
+      type:   { type: String, required: true, enum: ["PAN", "AADHAAR", "UDYAM", "GST", "OTHER"] },
       number: { type: String, required: true },
-      file: { url: String, public_id: String }
+      file:   { url: String, public_id: String }
     }],
 
     bank: {
-      bankName: { type: String },
-      branchName: { type: String },
+      bankName:          { type: String },
+      branchName:        { type: String },
       accountHolderName: { type: String },
-      accountNumber: { type: String },
-      ifscCode: { type: String },
-      beneficiaryName: { type: String }
+      accountNumber:     { type: String },
+      ifscCode:          { type: String },
+      beneficiaryName:   { type: String }
     },
 
-    isApproved: { type: Boolean, default: false },
-    dueAmount: { type: Number, default: 0 },
+    // 🔐 Credit & dues (paise)
+    dueAmountPaise:   { type: Number, set: int, default: 0 },  // source of truth (replace legacy dueAmount)
+    allowCredit:      { type: Boolean, default: false },
+    creditLimitPaise: { type: Number, set: int, default: 0 },
+    riskTier:         { type: String, enum: ["low","medium","high"], default: "low" },
+
+    // Legacy field kept for backward compatibility (mirror of dueAmountPaise in controllers)
+    dueAmount: { type: Number, default: 0 }, // DEPRECATED: keep until all reads migrate
+
+    // Account link
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+
+    // Optional flags
+    kycVerified: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
 
-// 🔒 Always keep mobile in-sync so the existing mobile_1 index is happy
+// 🔒 Keep phone & mobile in sync to satisfy unique index on mobile
 buyerSchema.pre("validate", function(next) {
   const p = this.phone || this.mobile;
-  if (!p || !String(p).trim()) {
-    return next(new Error("phone or mobile is required"));
-  }
+  if (!p || !String(p).trim()) return next(new Error("phone or mobile is required"));
   this.phone = String(p).trim();
   this.mobile = String(p).trim();
   next();
 });
-// ⛳️ CHANGES END
 
-/* Methods */
+// Password helpers
 buyerSchema.methods.setPassword = async function (plain) {
   const salt = await bcrypt.genSalt(10);
   this.passwordHash = await bcrypt.hash(plain, salt);
 };
-
 buyerSchema.methods.validatePassword = async function (plain) {
   if (!this.passwordHash) return false;
   return bcrypt.compare(plain, this.passwordHash);
 };
 
-/* Text index (remove old mobile text key) */
+// Text search
 buyerSchema.index({
   shopName: "text",
   name: "text",
@@ -98,7 +100,8 @@ buyerSchema.index({
   postalCode: "text",
 });
 
-// NOTE: Don't add another unique index on phone to avoid double-conflict;
-// existing unique mobile_1 index will enforce uniqueness effectively.
+// Fast filters
+buyerSchema.index({ allowCredit: 1, riskTier: 1 });
+buyerSchema.index({ dueAmountPaise: -1 });
 
 module.exports = mongoose.model("Buyer", buyerSchema);

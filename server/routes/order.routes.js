@@ -3,10 +3,10 @@ const router = express.Router();
 
 const { verifyJWT } = require("../middlewares/auth.middleware");
 const orderCtrl = require("../controllers/order.controller");
-const staffCtrl = require("../controllers/staff.controller"); // dispatch + invoice
+//const staffCtrl = require("../controllers/staff.controller"); // dispatch + invoice
 
 // Place & Read
-router.post("/",  orderCtrl.placeOrder);
+router.post("/",verifyJWT,  orderCtrl.placeOrder);
 router.get("/",  orderCtrl.getAllOrders);
 router.get("/:id",  orderCtrl.getOrderById);
 
@@ -14,7 +14,7 @@ router.get("/:id",  orderCtrl.getOrderById);
 router.patch("/:id/pack",  orderCtrl.markPacked);
 
 // Dispatch → (invoice/AWB etc.) handle in staffCtrl
-router.post("/:id/dispatch",  staffCtrl.markReadyToDispatch);
+//router.post("/:id/dispatch",  staffCtrl.markReadyToDispatch);
 
 router.patch("/:id/deliver",  orderCtrl.markDelivered);
 

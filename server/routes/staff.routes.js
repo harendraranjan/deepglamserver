@@ -16,12 +16,12 @@ router.get("/attendance/me",          staffCtrl.myAttendance);
 
 // --- Summary / Buyers / Orders ---
 router.get("/summary/me",    staffCtrl.mySummary);
-router.get("/buyers",        staffCtrl.myBuyers);
+router.get("/buyers",  verifyJWT,   staffCtrl.myBuyers);
 router.get("/orders",        staffCtrl.myOrders);
 router.get("/orders/count",  staffCtrl.myOrdersCount);
 
 // --- Orders workflow (dispatch + invoice) ---
-router.patch("/orders/:id/ready-to-dispatch",  staffCtrl.markReadyToDispatch);
+router.patch("/orders/:id/ready-to-dispatch", verifyJWT,  staffCtrl.markReadyToDispatch);
 
 // --- Payments ---
 router.get("/payments/pending",  staffCtrl.pendingPaymentsByStaff);

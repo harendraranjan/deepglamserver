@@ -1,11 +1,10 @@
-// controllers/product.controller.js
 const mongoose = require('mongoose');
 const Product = require('../models/product.model');
-const Seller = require('../models/seller.model');
+const Seller  = require('../models/seller.model');
 
 /* ---------- helpers ---------- */
 const toNum = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
-const toInt = v => Math.round(toNum(v));                // 👈 integers only
+const toInt = v => Math.round(toNum(v));
 const toStringArray = (v) => {
   if (!v) return [];
   if (Array.isArray(v)) return v.map(String).map(s => s.trim()).filter(Boolean);
@@ -17,12 +16,12 @@ const toStringArray = (v) => {
   return [];
 };
 
-// price calculator (returns integers)
+// price calculator
 const calc = ({ price, discountPercentage=0, discountAmount=0, gstPercentage=0, gstType='exclusive' }) => {
   const _price = toNum(price);
   const discPctAmt = _price * (toNum(discountPercentage)/100);
-  const disc = Math.max(toNum(discountAmount), discPctAmt);
-  const afterDisc = Math.max(_price - disc, 0);
+  theDisc = Math.max(toNum(discountAmount), discPctAmt);
+  const afterDisc = Math.max(_price - theDisc, 0);
 
   const inclusive = String(gstType).toLowerCase() === 'inclusive';
   const gstAmtFloat = inclusive
@@ -31,11 +30,10 @@ const calc = ({ price, discountPercentage=0, discountAmount=0, gstPercentage=0, 
 
   const finalFloat = inclusive ? afterDisc : (afterDisc + gstAmtFloat);
 
-  // 👇 force integers everywhere
   const priceAfterDiscount = toInt(afterDisc);
   const gstAmount          = toInt(gstAmtFloat);
   const finalPrice         = toInt(finalFloat);
-  const discountApplied    = toInt(disc);
+  const discountApplied    = toInt(theDisc);
 
   return { priceAfterDiscount, gstAmount, finalPrice, discountApplied };
 };
@@ -49,8 +47,17 @@ const toImageObj = (v) => {
 };
 const toImageObjArray = (arr) => (Array.isArray(arr) ? arr.map(toImageObj).filter(Boolean) : []);
 
+/** Resolve sellerId strictly from the authenticated user */
+async function resolveSellerId(req) {
+  const userId = req.user?._id || req.user?.id;
+  if (!userId) return null;
+  const seller = await Seller.findOne({ userId }).select('_id');
+  return seller ? String(seller._id) : null;
+}
+
 /* ---------------------------------------
-   CREATE (always needs approval)
+   CREATE PRODUCT (always disapproved initially)
+   - no sellerId in body/header; always derive from token user
 ----------------------------------------*/
 exports.createProduct = async (req, res) => {
   try {
@@ -59,7 +66,7 @@ exports.createProduct = async (req, res) => {
       hsnCode, MOQ, purchasePrice, margin = 0,
       discountPercentage = 0, discountAmount = 0, gstPercentage = 0, gstType = 'exclusive',
       sizes, colors, brand, stock,
-      sellerId,                         // can come from body
+      // sellerId,  // ❌ ignored now
       mainImage,
       images = [],
       description,
@@ -72,20 +79,14 @@ exports.createProduct = async (req, res) => {
       return res.status(400).json({ message: 'purchasePrice is required' });
     if (!mainImage)     return res.status(400).json({ message: 'mainImage URL is required' });
 
-    // resolve seller (body > header > user.seller)
-    let seller = sellerId || req.headers['x-seller-id'] || null;
-    if (!seller && req.user?._id) {
-      const s = await Seller.findOne({ userId: req.user._id }).select('_id');
-      if (s) seller = s._id;
-    }
-    if (!seller) return res.status(400).json({ message: 'sellerId (or x-seller-id) is required' });
-    if (!mongoose.isValidObjectId(seller)) return res.status(400).json({ message: 'Invalid seller id format' });
+    // 🔒 always resolve seller from logged-in user
+    const sellerId = await resolveSellerId(req);
+    if (!sellerId) return res.status(400).json({ message: 'Seller not found for this user' });
 
-    // integers only
-    const purchase = toInt(purchasePrice);
-    const marginNum = toNum(margin);
-    const basePriceFloat = purchase + (marginNum / 100) * purchase;
-    const basePrice = toInt(basePriceFloat);
+    // integers & price calculations
+    const purchase   = toInt(purchasePrice);
+    const marginNum  = toNum(margin);
+    const basePrice  = toInt(purchase + (marginNum / 100) * purchase);
 
     const { priceAfterDiscount, gstAmount, finalPrice, discountApplied } = calc({
       price: basePrice,
@@ -96,7 +97,7 @@ exports.createProduct = async (req, res) => {
     });
 
     const payload = {
-      seller,                                // NOTE: model ref ideally "Seller"
+      seller: sellerId,
       mainCategory,
       subCategory,
       productType: productType ? String(productType).toLowerCase() : undefined,
@@ -104,25 +105,22 @@ exports.createProduct = async (req, res) => {
       hsnCode,
       MOQ: toInt(MOQ),
       purchasePrice: purchase,
-      margin: toNum(margin),                 // keep % as number (can be decimal)
+      margin: toNum(margin),
       mrp: basePrice,
       discountPercentage: toNum(discountPercentage),
-      discountAmount: discountApplied,       // integer
+      discountAmount: discountApplied,
       gstPercentage: toNum(gstPercentage),
-      gstAmount,                             // integer
+      gstAmount,
       gstType,
-      finalPrice,                            // integer
+      finalPrice,
       sizes: toStringArray(sizes),
       colors: toStringArray(colors),
       brand,
       stock: toInt(stock),
-
       mainImage: toImageObj(mainImage),
       images: toImageObjArray(images),
-
       description: description ? String(description).trim() : "",
-      // 👇 NEW: every product must be approved → start as disapproved
-      status: "disapproved",
+      status: "disapproved", // force disapproved initially
       isActive: true,
     };
 
@@ -137,23 +135,22 @@ exports.createProduct = async (req, res) => {
 };
 
 /* ---------------------------------------
-   UPDATE (recalculate & force integers)
+   UPDATE PRODUCT
+   (kept same; if you want to restrict to owner, add a seller check)
 ----------------------------------------*/
 exports.updateProduct = async (req, res) => {
   try {
     const up = { ...req.body };
 
-    // normalize numeric → integers
     ['purchasePrice','discountAmount','gstAmount','finalPrice','mrp','stock','MOQ','gstPercentage','discountPercentage']
       .forEach(k => { if (up[k] != null) up[k] = toInt(up[k]); });
 
-    // if price-affecting fields present → recalc
     const priceInputs = ['purchasePrice','margin','discountPercentage','discountAmount','gstPercentage','gstType','mrp'];
     const shouldRecalc = priceInputs.some(k => k in up);
 
     if (shouldRecalc) {
-      // base: mrp if given else purchase+margin
-      const current = await Product.findById(req.params.id).select('purchasePrice margin mrp gstType gstPercentage discountPercentage discountAmount');
+      const current = await Product.findById(req.params.id)
+        .select('purchasePrice margin mrp gstType gstPercentage discountPercentage discountAmount');
       if (!current) return res.status(404).json({ message: "Product not found" });
 
       const purchase   = up.purchasePrice != null ? toInt(up.purchasePrice) : toInt(current.purchasePrice);
@@ -175,9 +172,14 @@ exports.updateProduct = async (req, res) => {
       up.finalPrice     = finalPrice;
     }
 
-    // images normalize
     if (up.mainImage) up.mainImage = toImageObj(up.mainImage);
     if (up.images)    up.images    = toImageObjArray(up.images);
+
+    // (Optional) Ownership guard — uncomment to restrict updates to own products
+    // const sellerId = await resolveSellerId(req);
+    // if (!sellerId) return res.status(400).json({ message: 'Seller not found for this user' });
+    // const owned = await Product.findOne({ _id: req.params.id, seller: sellerId }).select('_id');
+    // if (!owned) return res.status(403).json({ message: 'Forbidden: cannot modify another seller’s product' });
 
     const updated = await Product.findByIdAndUpdate(req.params.id, up, { new: true });
     if (!updated) return res.status(404).json({ message: "Product not found" });
@@ -188,14 +190,13 @@ exports.updateProduct = async (req, res) => {
 };
 
 /* ---------------------------------------
-   LISTS with approval filters (status)
+   LIST / FILTER PRODUCTS
 ----------------------------------------*/
 exports.getAllProducts = async (req, res) => {
   try {
-    const { approved } = req.query; // "true" | "false" | undefined
+    const { approved } = req.query;
     const filter = {};
 
-    // map approved → status
     if (approved === "true")  filter.status = "approved";
     if (approved === "false") filter.status = "disapproved";
 
@@ -205,41 +206,6 @@ exports.getAllProducts = async (req, res) => {
     res.status(500).json({ message: "Failed to fetch products", error: err.message });
   }
 };
-
-// server/controllers/product.controller.js (snippet)
-exports.getMyProducts = async (req, res) => {
-  try {
-    const sellerId = req.user.sellerId || req.user._id; // ensure auth sets this
-    const { q, status, sort = "-createdAt", page = 1, limit = 12 } = req.query;
-
-    const filter = { seller: sellerId }; // 👈 your model has field `seller`
-    if (status) filter.status = status;
-
-    if (q) {
-      const rx = new RegExp(q, "i");
-      filter.$or = [
-        { productname: rx },
-        { brand: rx },
-        { hsn: rx },
-        { hsnCode: rx },
-      ];
-    }
-
-    const p = parseInt(page, 10) || 1;
-    const l = parseInt(limit, 10) || 12;
-    const skip = (p - 1) * l;
-
-    const [items, total] = await Promise.all([
-      Product.find(filter).sort(sort).skip(skip).limit(l).lean(),
-      Product.countDocuments(filter),
-    ]);
-
-    res.json({ ok: true, total, items });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: "Failed to fetch products", error: e.message });
-  }
-};
-
 
 exports.getDisapprovedProducts = async (req, res) => {
   try {
@@ -251,7 +217,7 @@ exports.getDisapprovedProducts = async (req, res) => {
 };
 
 /* ---------------------------------------
-   APPROVE / CLONE
+   APPROVE / CLONE PRODUCT
 ----------------------------------------*/
 exports.approveProduct = async (req, res) => {
   try {
@@ -275,10 +241,9 @@ exports.cloneProduct = async (req, res) => {
       _id: undefined,
       createdAt: undefined,
       updatedAt: undefined,
-      status: "disapproved", // cloned product also needs approval
+      status: "disapproved",
     });
 
-    // force integer amounts on clone as well
     clone.purchasePrice  = toInt(clone.purchasePrice);
     clone.mrp            = toInt(clone.mrp);
     clone.discountAmount = toInt(clone.discountAmount);
@@ -294,26 +259,20 @@ exports.cloneProduct = async (req, res) => {
   }
 };
 
-// ---------- Get Product By ID ----------
+/* ---------------------------------------
+   GET PRODUCT BY ID
+----------------------------------------*/
 exports.getProductById = async (req, res) => {
   try {
     const { id } = req.params;
-
-    // validate
     if (!id) return res.status(400).json({ ok: false, message: "Product ID is required" });
 
     const product = await Product.findById(id)
       .populate("seller", "brandName userId")
       .lean();
 
-    if (!product) {
-      return res.status(404).json({ ok: false, message: "Product not found" });
-    }
-
-    // Round off finalAmount or any total field (no decimal)
-    if (product.finalPrice !== undefined) {
-      product.finalPrice = Math.floor(product.finalPrice);
-    }
+    if (!product) return res.status(404).json({ ok: false, message: "Product not found" });
+    if (product.finalPrice !== undefined) product.finalPrice = Math.floor(product.finalPrice);
 
     res.json({ ok: true, product });
   } catch (err) {

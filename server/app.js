@@ -15,27 +15,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Core middlewares
-const allowedOrigins = [
-  "http://localhost:3000",                // ✅ Next.js dev
-  "https://deepglamadmin.vercel.app",     // ✅ your deployed admin panel (adjust domain)
-];
-
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true); // allow Postman / curl
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      } else {
-        return callback(new Error("Not allowed by CORS: " + origin));
-      }
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-  })
-);
-
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(morgan("dev"));
@@ -47,7 +27,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
  * Route imports
  * --------------------------- */
 const authRoutes = require("./routes/auth.routes");
-const userRoutes = require("./routes/user.routes");
+//const userRoutes = require("./routes/user.routes");
 const productRoutes = require("./routes/product.routes");
 const orderRoutes = require("./routes/order.routes");
 const wishlistRoutes = require("./routes/wishlist.routes");
@@ -64,7 +44,7 @@ const buyerRoutes = require("./routes/buyer.routes"); // 👈 added
  * Mount routes (prefixes)
  * --------------------------- */
 app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
+//app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/wishlist", wishlistRoutes);
